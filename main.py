@@ -18,12 +18,16 @@ generated (no real circuit), physical constants are rough public-domain
 figures for 2026-era F1 cars, and the "driving line" is a simple
 curvature-based heuristic (not an optimized minimum-curvature line).
 
-Author: demo for OR project by Nitin Tony Paul
-"""
 
+IMMEDIATE NEXT STEPS:
+- Compute QSS on driving line instead of the circuit
+- Construct `models` module and implement dynamics
+- Separate plotting engine for visual customization
+"""
+ 
 import numpy as np
 import matplotlib.pyplot as plt
-from utils import qss
+from utils import qss, gettrack as gt
 
 rng = np.random.default_rng(100)
 
@@ -51,129 +55,7 @@ v_top      = 100.0        # m/s (~360 km/h) absolute top-speed cap
 v_min      = 15.0         # m/s floor, avoids division singularities
 
 # ---------------------------------------------------------------------------
-# 1. Random track generator (NOT a real circuit)
-#    A closed loop is built from random control points placed around a
-#    circle (angularly sorted, radially jittered -> avoids self-intersection)
-#    and connected with a periodic Catmull-Rom spline. This produces a mix
-#    of long straights and tight hairpins, similar in spirit to simple
-#    procedural-track generators used in racing-line RL environments.
-#    No third-party track library is used.
-# ---------------------------------------------------------------------------
-def _catmull_rom_periodic(pts, samples_per_seg=60):
-    """pts: (n,2) control points, closed loop. Returns fine (x,y) path."""
-    n = len(pts)
-    u = np.linspace(0, 1, samples_per_seg, endpoint=False)
-    U = np.stack([np.ones_like(u), u, u**2, u**3], axis=1)   # (S,4)
-    basis = 0.5 * np.array([[0, 2, 0, 0],
-                             [-1, 0, 1, 0],
-                             [2, -5, 4, -1],
-                             [-1, 3, -3, 1]])                 # (4,4)
-    M = U @ basis                                             # (S,4)
-
-    xs, ys = [], []
-    for i in range(n):
-        p0, p1, p2, p3 = pts[(i - 1) % n], pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
-        seg_pts = np.stack([p0, p1, p2, p3], axis=0)          # (4,2)
-        seg = M @ seg_pts                                      # (S,2)
-        xs.append(seg[:, 0])
-        ys.append(seg[:, 1])
-    return np.concatenate(xs), np.concatenate(ys)
-
-
-def generate_track(seed=None, R0=500.0, n_ctrl=16, radius_jitter=0.55,
-                    samples_per_seg=60):
-    rgen = np.random.default_rng(seed)
-
-    # angularly sorted control points (guarantees a simple, non self
-    # intersecting loop) with strong radial jitter -> some tight corners
-    base_theta = np.linspace(0, 2 * np.pi, n_ctrl, endpoint=False)
-    theta_jitter = rgen.uniform(-0.5, 0.5, n_ctrl) * (np.pi / n_ctrl) * 0.6
-    ctrl_theta = base_theta + theta_jitter
-    ctrl_r = R0 * (1.0 + rgen.uniform(-radius_jitter, radius_jitter, n_ctrl))
-    ctrl_pts = np.stack([ctrl_r * np.cos(ctrl_theta),
-                          ctrl_r * np.sin(ctrl_theta)], axis=1)
-
-    x, y = _catmull_rom_periodic(ctrl_pts, samples_per_seg=samples_per_seg)
-    n_fine = len(x)
-    t_param = np.arange(n_fine)                    # uniform parameter index
-
-    # numerical derivatives wrt parameter (curvature formula is invariant
-    # to the choice of regular parameterization)
-    dx = np.gradient(x, t_param, edge_order=2)
-    dy = np.gradient(y, t_param, edge_order=2)
-    d2x = np.gradient(dx, t_param, edge_order=2)
-    d2y = np.gradient(dy, t_param, edge_order=2)
-
-    speed = np.sqrt(dx**2 + dy**2) + 1e-9
-    kappa = (dx * d2y - dy * d2x) / speed**3
-
-    ds_fine = np.concatenate([[0.0], np.cumsum(
-        0.5 * (speed[:-1] + speed[1:]))])
-    DL = ds_fine[-1] + 0.5 * (speed[-1] + speed[0])   # closes the loop
-
-    return dict(theta=t_param, x=x, y=y, kappa=kappa, s=ds_fine, DL=DL)
-
-
-def discretize_track(track, n_seg=60):
-    """Resample the track into n_seg segments of EQUAL arc length ds,
-    as required by the spatial discretization in the PDF (Section 1)."""
-    s = track["s"]
-    DL = track["DL"]
-    s_bounds = np.linspace(0, DL, n_seg + 1)
-    theta_of_s = np.interp(s_bounds, s, track["theta"])
-
-    x_b = np.interp(s_bounds, s, track["x"])
-    y_b = np.interp(s_bounds, s, track["y"])
-    kappa_b = np.interp(s_bounds, s, track["kappa"])
-
-    ds = DL / n_seg
-    return dict(s_bounds=s_bounds, x=x_b, y=y_b, kappa=kappa_b, ds=ds,
-                n_seg=n_seg, DL=DL)
-
-
-# ---------------------------------------------------------------------------
-# 2. Theoretical (ballpark) v_max per segment from corner curvature,
-#    including a simple downforce fixed-point iteration:
-#        v_max^2 * m / r = mu * (m*g + 0.5*rho*ClA*v_max^2)
-# ---------------------------------------------------------------------------
-def segment_vmax(kappa, r_min=12.0):
-    """Closed-form solve of  v^2*m/r = mu*(m*g + 0.5*rho*ClA*v^2)  for v,
-    i.e.  v = sqrt( mu*m*g / (m/r - 0.5*mu*rho*ClA) ), capped by v_top.
-    If downforce-generated grip alone would out-run the required
-    centripetal force at all speeds, the corner is effectively
-    speed-unlimited by this model and we just cap at v_top."""
-    r = 1.0 / np.maximum(np.abs(kappa), 1.0 / 5000.0)   # curvature -> radius
-    r = np.maximum(r, r_min)                             # realistic min radius
-    denom = m / r - 0.5 * mu_tire * rho_air * ClA
-    vmax = np.where(denom > 1e-6,
-                     np.sqrt(mu_tire * m * g / np.maximum(denom, 1e-6)),
-                     v_top)
-    return np.minimum(vmax, v_top)
-
-
-# ---------------------------------------------------------------------------
-# 3. A simple (non-optimal) driving line: centerline offset toward the
-#    inside of a corner, scaled by local curvature. Purely a visual /
-#    heuristic "racing line", not a minimum-curvature optimization.
-# ---------------------------------------------------------------------------
-def driving_line(disc, track_half_width=6.0):
-    x, y, kappa = disc["x"], disc["y"], disc["kappa"]
-    dx = np.gradient(x)
-    dy = np.gradient(y)
-    norm = np.sqrt(dx**2 + dy**2) + 1e-9
-    nx, ny = -dy / norm, dx / norm            # unit normal
-
-    kappa_ref = 1.0 / 150.0
-    max_offset = 0.8 * track_half_width
-    offset = -max_offset * np.tanh(kappa / kappa_ref)
-
-    line_x = x + offset * nx
-    line_y = y + offset * ny
-    return line_x, line_y
-
-
-# ---------------------------------------------------------------------------
-# 4. Force model (Eq. 2)
+#    Force model (Eq. 2)
 # ---------------------------------------------------------------------------
 def F_ice(v):
     """Traction-limited at low speed, power-limited at high speed."""
@@ -184,7 +66,7 @@ def F_drag(v, drag_mult):
 
 
 # ---------------------------------------------------------------------------
-# 5. Braking-zone flags & regen energy potential R(d_t) (Eq. 4)
+#    Braking-zone flags & regen energy potential R(d_t) (Eq. 4)
 # ---------------------------------------------------------------------------
 def braking_zones_and_regen(vmax, ds):
     n_seg = len(vmax) - 1
@@ -206,7 +88,7 @@ def drag_multiplier(kappa, kappa_thresh=1.0 / 300.0):
 
 
 # ---------------------------------------------------------------------------
-# 6. Bilinear interpolation, vectorized (grid -> arbitrary query shape)
+#    Bilinear interpolation, vectorized (grid -> arbitrary query shape)
 # ---------------------------------------------------------------------------
 def interp2d_vec(x_grid, y_grid, table, xq, yq):
     xq, yq = np.broadcast_arrays(xq, yq)
@@ -231,7 +113,7 @@ def interp2d_vec(x_grid, y_grid, table, xq, yq):
 
 
 # ---------------------------------------------------------------------------
-# 7. Stochastic Bellman backward recursion (Eq. 6) over a (v, b) grid
+#    Stochastic Bellman backward recursion (Eq. 6) over a (v, b) grid
 # ---------------------------------------------------------------------------
 def solve_bellman(disc, vmax, BZ, R, n_v=31, n_b=25, n_u=11):
     n_seg = disc["n_seg"]
@@ -295,7 +177,7 @@ def solve_bellman(disc, vmax, BZ, R, n_v=31, n_b=25, n_u=11):
 
 
 # ---------------------------------------------------------------------------
-# 8. Forward simulation using the optimal policy (deterministic or
+#    Forward simulation using the optimal policy (deterministic or
 #    Monte-Carlo with battery noise, to show the "stochastic" behaviour)
 # ---------------------------------------------------------------------------
 def simulate(disc, vmax, BZ, R, sol, v0=None, b0=None, stochastic=False, rng=None):
@@ -345,20 +227,19 @@ def simulate(disc, vmax, BZ, R, sol, v0=None, b0=None, stochastic=False, rng=Non
 
 
 # ---------------------------------------------------------------------------
-# 9. Run the full demo
+#    Run the full demo
 # ---------------------------------------------------------------------------
 def main():
-    track = generate_track(seed=100)
-    disc = discretize_track(track, n_seg=1000)
+    track = gt.generate_track(seed=1)
+    disc = gt.discretize_track(track, n_seg=1000)
 
-    # ----- QSS v_max computation -----
+    # ----- twopass QSS v_max computation -----
     vehicle = qss.VehicleParams(mass=m, mu=mu_tire, rho=rho_air, cl_a=ClA, v_top=v_top)
-    vmax_seg = qss.compute_qss_vmax(disc["kappa"], disc["ds"], vehicle,
-                                 a_accel_max=6.0, a_brake_max=45.0)
-    # ---------------------------------E
+    vmax_seg = qss.compute_qss_vmax(disc["kappa"], disc["ds"], vehicle, a_accel_max=6.0, a_brake_max=45.0)
+    # ---------------------------------
     
     BZ, R = braking_zones_and_regen(vmax_seg, disc["ds"])
-    line_x, line_y = driving_line(disc)
+    line_x, line_y = gt.driving_line(disc)
 
     print(f"Track length DL              : {disc['DL']:8.1f} m")
     print(f"Number of segments N         : {disc['n_seg']:8d}")
@@ -393,14 +274,14 @@ def main():
                      cmap="viridis", s=10, label="centerline (vmax)")
     ax.plot(line_x, line_y, color="red", lw=1.5, label="driving line")
     ax.set_aspect("equal")
-    ax.set_title("Randoml track + driving line")
+    ax.set_title("Random track + driving line")
     ax.legend(loc="upper right", fontsize=8)
     plt.colorbar(sc, ax=ax, label=r"theoretical $v_{max}$ (m/s)")
 
     # (b) velocity profile: theoretical ceiling vs DP-optimal trajectory
     ax = axes[0, 1]
     ax.plot(disc["s_bounds"], vmax_seg, "k--", label=r"$v_{max}(d)$ ceiling")
-    ax.plot(disc["s_bounds"], sim["v"], "b-", label="optimal v_t (DP)")
+    ax.plot(disc["s_bounds"], sim["v"], "b-", label=r"optimal $v_t$ (DP)")
     ax.set_xlabel("distance s (m)")
     ax.set_ylabel("velocity (m/s)")
     ax.set_title("Velocity profile")

@@ -23,8 +23,6 @@ Track is treated as a closed loop: the three passes are iterated a few
 times around the loop so information propagates all the way around
 (e.g. a slow hairpin just after the start/finish line should also pull
 down the ceiling on the last straight, which needs wraparound to see).
-
-No dependency on the rest of the project -> safe to import anywhere.
 """
 
 from dataclasses import dataclass
@@ -97,26 +95,42 @@ def backward_pass(v_ceiling, ds, a_brake_max, n_loops=3):
 
 
 # ---------------------------------------------------------------------
-# Top-level: full 3-pass QSS profile
+# Top-level: QSS profile
+#
+# NOTE on the forward (acceleration-limited) pass: it is deliberately
+# NOT called by default below. In a standalone QSS sim (no underlying
+# force model) it's needed to stop the ceiling itself from implying an
+# unrealistic instantaneous speed jump out of a slow corner. Here, that
+# job is already done - more accurately - by the Bellman recursion's own
+# velocity update (v_next = v + Fn(v,u)/m*dt), which uses the real
+# F_ICE/F_MGU-K/drag/rolling model rather than a flat a_accel_max
+# ballpark. Keeping the forward pass in the ceiling on top of that would
+# be a redundant, cruder second acceleration cap. The function is left
+# in place (unused by default) so it can be re-enabled for comparison.
 # ---------------------------------------------------------------------
 def compute_qss_vmax(curvatures, ds, vehicle: VehicleParams,
-                      a_accel_max=6.0, a_brake_max=45.0, n_loops=3):
+                      a_accel_max=6.0, a_brake_max=45.0, n_loops=3,
+                      use_forward_pass=False):
     """
     curvatures : array of length N+1, signed or unsigned curvature at each
                  segment BOUNDARY (matches discretize_track()'s kappa_b).
     ds         : scalar, or array of length N (per-segment length).
     vehicle    : VehicleParams.
-    a_accel_max: ballpark best-case forward acceleration capability, m/s^2
-                 (traction/power limited; ~6 m/s^2 is a reasonable
-                 low-to-mid-speed F1 ballpark - lower than full launch accel
-                 since this profile also has to hold near top speed).
+    a_accel_max: only used if use_forward_pass=True. Ballpark best-case
+                 forward acceleration capability, m/s^2.
     a_brake_max: ballpark best-case braking deceleration, m/s^2
                  (F1 cars can pull ~5-6g under heavy braking with
                  downforce -> ~45-55 m/s^2 ballpark).
+    use_forward_pass: if True, restores the original 3-pass behaviour
+                 (cornering -> forward -> backward) for A/B comparison.
+                 Default False -> 2-pass: cornering -> backward only.
 
     Returns v_max_eff, the same shape/semantics as the old segment_vmax().
     """
     v_corner = cornering_vmax(curvatures, vehicle)
-    v_fwd = forward_pass(v_corner, ds, a_accel_max, n_loops=n_loops)
-    v_eff = backward_pass(v_fwd, ds, a_brake_max, n_loops=n_loops)
+
+    if use_forward_pass:
+        v_corner = forward_pass(v_corner, ds, a_accel_max, n_loops=n_loops)
+
+    v_eff = backward_pass(v_corner, ds, a_brake_max, n_loops=n_loops)
     return v_eff
