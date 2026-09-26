@@ -1,15 +1,29 @@
 """
 Stochastic Dynamic Programming for Optimal Power-Split Control in F1
 =====================================================================
+Demo implementation of the formulation in the project PDFs:
+  - Eq (1): stage-additive lap-time objective, min sum ell(v_t,u_t)
+  - Eq (2): net force Fn = F_ICE(v) + u*Pmax_MGUK/v - Fdrag(v,d) - Frolling
+  - Eq (3): velocity update, clipped by segment vmax(d)
+  - Eq (4): battery SoC update with regen harvesting + stochastic noise
+  - Eq (5): stage cost ell(v,u) = ds / v
+  - Eq (6): Bellman backward recursion, V_T(v,b) = 0 for all (v,b)
+  - Extra constraints supplied separately:
+        b_t = 0  =>  u_t = 0
+        0 <= b_t <= b_max = 4 MJ
+        V_T(v,b) = 0  for all (v,b)
 
 This is a BALLPARK demo (not a competition lap-sim): track is randomly
 generated (no real circuit), physical constants are rough public-domain
 figures for 2026-era F1 cars, and the "driving line" is a simple
 curvature-based heuristic (not an optimized minimum-curvature line).
+
+Author: demo for OR project by Nitin Tony Paul
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
+from utils import qss
 
 rng = np.random.default_rng(100)
 
@@ -336,7 +350,13 @@ def simulate(disc, vmax, BZ, R, sol, v0=None, b0=None, stochastic=False, rng=Non
 def main():
     track = generate_track(seed=100)
     disc = discretize_track(track, n_seg=1000)
-    vmax_seg = segment_vmax(disc["kappa"])
+
+    # ----- QSS v_max computation -----
+    vehicle = qss.VehicleParams(mass=m, mu=mu_tire, rho=rho_air, cl_a=ClA, v_top=v_top)
+    vmax_seg = qss.compute_qss_vmax(disc["kappa"], disc["ds"], vehicle,
+                                 a_accel_max=6.0, a_brake_max=45.0)
+    # ---------------------------------E
+    
     BZ, R = braking_zones_and_regen(vmax_seg, disc["ds"])
     line_x, line_y = driving_line(disc)
 
