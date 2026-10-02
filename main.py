@@ -27,7 +27,8 @@ IMMEDIATE NEXT STEPS:
  
 import numpy as np
 import matplotlib.pyplot as plt
-from utils import qss, gettrack as gt
+from matplotlib.collections import LineCollection
+from utils import qss, gettrack as gt, dynamics 
 
 rng = np.random.default_rng(100)
 
@@ -41,7 +42,6 @@ rho_air    = 1.225        # kg/m^3
 CdA        = 1.20         # m^2, drag area (Cd * frontal area), ballpark
 ClA        = 3.50         # m^2, downforce area (Cl * frontal area), ballpark
 Crr        = 0.015        # rolling resistance coefficient, ballpark
-F_rolling  = Crr * m * g  # N, constant rolling resistance force (eq. 2)
 
 P_ice_max   = 400e3       # W, ballpark ICE peak power under 2026 regs (~536 hp)
 P_mguk_max  = 350e3       # W, ballpark MGU-K peak power under 2026 regs
@@ -53,39 +53,6 @@ eta_regen  = 0.6          # regen harvesting efficiency, ballpark
 
 v_top      = 100.0        # m/s (~360 km/h) absolute top-speed cap
 v_min      = 15.0         # m/s floor, avoids division singularities
-
-# ---------------------------------------------------------------------------
-#    Force model (Eq. 2)
-# ---------------------------------------------------------------------------
-def F_ice(v):
-    """Traction-limited at low speed, power-limited at high speed."""
-    return np.minimum(F_trac_max, P_ice_max / np.maximum(v, 1.0))
-
-def F_drag(v, drag_mult):
-    return 0.5 * rho_air * CdA * drag_mult * v**2
-
-
-# ---------------------------------------------------------------------------
-#    Braking-zone flags & regen energy potential R(d_t) (Eq. 4)
-# ---------------------------------------------------------------------------
-def braking_zones_and_regen(vmax, ds):
-    n_seg = len(vmax) - 1
-    BZ = np.zeros(n_seg, dtype=bool)
-    R = np.zeros(n_seg)
-    for t in range(n_seg):
-        if vmax[t + 1] < vmax[t] - 2.0:      # must shed speed -> braking zone
-            BZ[t] = True
-            v_avg = 0.5 * (vmax[t] + vmax[t + 1])
-            t_brake = ds / max(v_avg, 1.0)
-            energy_available = 0.5 * m * (vmax[t]**2 - vmax[t + 1]**2)
-            R[t] = min(P_mguk_max * t_brake, energy_available)
-    return BZ, R
-
-
-def drag_multiplier(kappa, kappa_thresh=1.0 / 300.0):
-    """Straights (low curvature) run a lower-drag / DRS-like aero setting."""
-    return np.where(np.abs(kappa) < kappa_thresh, 0.80, 1.00)
-
 
 # ---------------------------------------------------------------------------
 #    Bilinear interpolation, vectorized (grid -> arbitrary query shape)
@@ -119,7 +86,7 @@ def solve_bellman(disc, vmax, BZ, R, n_v=31, n_b=25, n_u=11):
     n_seg = disc["n_seg"]
     ds = disc["ds"]
     kappa = disc["kappa"]
-    drag_mult = drag_multiplier(kappa)
+    drag_mult = dynamics.drag_multiplier(kappa)
 
     v_grid = np.linspace(v_min, v_top, n_v)
     b_grid = np.linspace(0.0, b_max, n_b)
@@ -139,18 +106,20 @@ def solve_bellman(disc, vmax, BZ, R, n_v=31, n_b=25, n_u=11):
     eps = noise_vals.reshape(1, 1, 1, -1)
 
     dt_arr = ds / v_col                                    # (Nv,1,1,1)
-    Fice = F_ice(v_col)                                     # (Nv,1,1,1)
+    Fice = dynamics.F_ice(F_trac_max, P_ice_max, v_col)                                     # (Nv,1,1,1)
 
     for t in reversed(range(n_seg)):
         V_next = V[t + 1]                                   # (Nv, Nb)
 
-        Fmguk = u_row * P_mguk_max / v_col                   # (Nv,1,Nu,1)
-        Fdrag = F_drag(v_col, drag_mult[t])                  # (Nv,1,1,1)
-        Fn = Fice + Fmguk - Fdrag - F_rolling                # (Nv,1,Nu,1)
+        Fmguk = dynamics.F_MGUK(P_mguk_max, u_row, v_col)                        #(Nv,1,Nu,1)
+        Fdrag = dynamics.F_drag(rho_air, CdA, v_col, drag_mult[t])                  # (Nv,1,1,1)
+        Fn = Fice + Fmguk - Fdrag - dynamics.F_rolling(Crr, m, g)                # (Nv,1,Nu,1)
 
+        # ---- NEXT STEP VELOCITY ----
         v_next = np.minimum(v_col + Fn / m * dt_arr, vmax[t + 1])
         v_next = np.clip(v_next, v_min, v_top)               # (Nv,1,Nu,1)
 
+        # ---- NEXT STEP BATTERY ----
         b_deploy = u_row * P_mguk_max * dt_arr               # (Nv,1,Nu,1)
         regen = float(BZ[t]) * eta_regen * R[t]
 
@@ -162,6 +131,7 @@ def solve_bellman(disc, vmax, BZ, R, n_v=31, n_b=25, n_u=11):
 
         EV = np.tensordot(Vq, noise_wts, axes=([3], [0]))    # (Nv,Nb,Nu)
 
+        # ---- PER STEP COST ----
         ell = (ds / v_grid).reshape(n_v, 1, 1)               # Eq. 5 stage cost
         cost = ell + EV                                      # (Nv,Nb,Nu)
 
@@ -203,8 +173,7 @@ def simulate(disc, vmax, BZ, R, sol, v0=None, b0=None, stochastic=False, rng=Non
             u = 0.0
 
         dt_seg = ds / max(v, 1.0)
-        Fn = (F_ice(v) + u * P_mguk_max / max(v, 1.0)
-              - F_drag(v, drag_mult[t]) - F_rolling)
+        Fn = (dynamics.F_ice(F_trac_max, P_ice_max, v) + u * P_mguk_max / max(v, 1.0) - dynamics.F_drag(rho_air, CdA, v, drag_mult[t]) - dynamics.F_rolling(Crr, m, g))
         v_next = min(v + Fn / m * dt_seg, vmax[t + 1])
         v_next = float(np.clip(v_next, v_min, v_top))
 
@@ -230,21 +199,26 @@ def simulate(disc, vmax, BZ, R, sol, v0=None, b0=None, stochastic=False, rng=Non
 #    Run the full demo
 # ---------------------------------------------------------------------------
 def main():
+
     track = gt.generate_track(seed=1)
     disc = gt.discretize_track(track, n_seg=1000)
+
+    line_x, line_y = gt.driving_line(disc)
+    line_x, line_y, ds_line = gt.resample_equal_arclength(line_x, line_y, disc["n_seg"])
+    disc["kappa"] = gt.line_curvature(line_x, line_y, ds_line)
+    disc["ds"] = ds_line
 
     # ----- twopass QSS v_max computation -----
     vehicle = qss.VehicleParams(mass=m, mu=mu_tire, rho=rho_air, cl_a=ClA, v_top=v_top)
     vmax_seg = qss.compute_qss_vmax(disc["kappa"], disc["ds"], vehicle, a_accel_max=6.0, a_brake_max=45.0)
     # ---------------------------------
-    
-    BZ, R = braking_zones_and_regen(vmax_seg, disc["ds"])
-    line_x, line_y = gt.driving_line(disc)
 
-    print(f"Track length DL              : {disc['DL']:8.1f} m")
-    print(f"Number of segments N         : {disc['n_seg']:8d}")
-    print(f"Segment length ds            : {disc['ds']:8.2f} m")
-    print(f"Braking zones identified     : {int(BZ.sum()):8d}")
+    BZ, R = dynamics.braking_zones_and_regen(m, P_mguk_max, vmax_seg, disc["ds"])
+
+    print(f"Track length                    : {disc['DL']:8.1f} m")
+    print(f"Number of segments              : {disc['n_seg']:8d}")
+    print(f"Segment length (driving line)   : {disc['ds']:8.2f} m")
+    print(f"Braking zones identified        : {int(BZ.sum()):8d}")
     print("Solving stochastic Bellman recursion (this may take a few seconds)...")
 
     sol = solve_bellman(disc, vmax_seg, BZ, R, n_v=31, n_b=25, n_u=11)
@@ -254,7 +228,7 @@ def main():
 
     # Monte-Carlo forward rollouts under battery noise to show the
     # stochastic character of the problem
-    n_mc = 200
+    n_mc = 10
     mc_rng = np.random.default_rng(1)
     mc_times = np.array([
         simulate(disc, vmax_seg, BZ, R, sol, stochastic=True, rng=mc_rng)["lap_time"]
@@ -268,15 +242,31 @@ def main():
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 10))
 
-    # (a) track + driving line, colored by theoretical vmax
     ax = axes[0, 0]
-    sc = ax.scatter(disc["x"], disc["y"], c=np.append(vmax_seg[:-1], vmax_seg[-1]),
-                     cmap="viridis", s=10, label="centerline (vmax)")
-    ax.plot(line_x, line_y, color="red", lw=1.5, label="driving line")
+    ax.plot(disc["x"][0], disc["y"][0], marker="s", color="white", markeredgecolor="black", markersize=10, zorder=3, label="start/finish")
+
+    track_half_width = 15.0
+    nx, ny = gt._unit_normals(disc["x"][:-1], disc["y"][:-1])
+    left_x  = disc["x"][:-1] + track_half_width * nx
+    left_y  = disc["y"][:-1] + track_half_width * ny
+    right_x = disc["x"][:-1] - track_half_width * nx
+    right_y = disc["y"][:-1] - track_half_width * ny
+
+    poly_x = np.concatenate([left_x, right_x[::-1]])
+    poly_y = np.concatenate([left_y, right_y[::-1]])
+    ax.fill(poly_x, poly_y, color="#4a4a4a", zorder=1, label="track surface")
+
+    points = np.array([line_x, line_y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points, np.roll(points, -1, axis=0)], axis=1)
+    lc = LineCollection(segments, cmap="viridis", linewidth=2, zorder=2)
+    lc.set_array(vmax_seg)
+    ax.add_collection(lc)
+
+    ax.set_xlim(poly_x.min() - 20, poly_x.max() + 20)
+    ax.set_ylim(poly_y.min() - 20, poly_y.max() + 20)
     ax.set_aspect("equal")
     ax.set_title("Random track + driving line")
-    ax.legend(loc="upper right", fontsize=8)
-    plt.colorbar(sc, ax=ax, label=r"theoretical $v_{max}$ (m/s)")
+    plt.colorbar(lc, ax=ax, label=r"theoretical $v_{max}$ (m/s)")
 
     # (b) velocity profile: theoretical ceiling vs DP-optimal trajectory
     ax = axes[0, 1]

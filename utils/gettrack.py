@@ -37,39 +37,6 @@ def _catmull_rom_periodic(pts, samples_per_seg=60):
         ys.append(seg[:, 1])
     return np.concatenate(xs), np.concatenate(ys)
 
-def generate_track(seed=None, R0=500.0, n_ctrl=16, radius_jitter=0.55,
-                    samples_per_seg=60):
-    rgen = np.random.default_rng(seed)
-
-    # angularly sorted control points (guarantees a simple, non self
-    # intersecting loop) with strong radial jitter -> some tight corners
-    base_theta = np.linspace(0, 2 * np.pi, n_ctrl, endpoint=False)
-    theta_jitter = rgen.uniform(-0.5, 0.5, n_ctrl) * (np.pi / n_ctrl) * 0.6
-    ctrl_theta = base_theta + theta_jitter
-    ctrl_r = R0 * (1.0 + rgen.uniform(-radius_jitter, radius_jitter, n_ctrl))
-    ctrl_pts = np.stack([ctrl_r * np.cos(ctrl_theta),
-                          ctrl_r * np.sin(ctrl_theta)], axis=1)
-
-    x, y = _catmull_rom_periodic(ctrl_pts, samples_per_seg=samples_per_seg)
-    n_fine = len(x)
-    t_param = np.arange(n_fine)                    # uniform parameter index
-
-    # numerical derivatives wrt parameter (curvature formula is invariant
-    # to the choice of regular parameterization)
-    dx = np.gradient(x, t_param, edge_order=2)
-    dy = np.gradient(y, t_param, edge_order=2)
-    d2x = np.gradient(dx, t_param, edge_order=2)
-    d2y = np.gradient(dy, t_param, edge_order=2)
-
-    speed = np.sqrt(dx**2 + dy**2) + 1e-9
-    kappa = (dx * d2y - dy * d2x) / speed**3
-
-    ds_fine = np.concatenate([[0.0], np.cumsum(
-        0.5 * (speed[:-1] + speed[1:]))])
-    DL = ds_fine[-1] + 0.5 * (speed[-1] + speed[0])   # closes the loop
-
-    return dict(theta=t_param, x=x, y=y, kappa=kappa, s=ds_fine, DL=DL)
-
 def _unit_normals(x, y):
     """Left-hand unit normal at each point of an (open) polyline, via
     simple centered finite differences on the tangent direction."""
@@ -119,6 +86,62 @@ def _relax_alpha(x, y, nx, ny, max_offset, n_iters=300, step_size=0.5,
     return alpha
 
 # ---------- CORE FUNCTIONS ----------
+
+def generate_track(seed=None, R0=500.0, n_ctrl=16, radius_jitter=0.55,
+                    samples_per_seg=60):
+    rgen = np.random.default_rng(seed)
+
+    # angularly sorted control points (guarantees a simple, non self
+    # intersecting loop) with strong radial jitter -> some tight corners
+    base_theta = np.linspace(0, 2 * np.pi, n_ctrl, endpoint=False)
+    theta_jitter = rgen.uniform(-0.5, 0.5, n_ctrl) * (np.pi / n_ctrl) * 0.6
+    ctrl_theta = base_theta + theta_jitter
+    ctrl_r = R0 * (1.0 + rgen.uniform(-radius_jitter, radius_jitter, n_ctrl))
+    ctrl_pts = np.stack([ctrl_r * np.cos(ctrl_theta),
+                          ctrl_r * np.sin(ctrl_theta)], axis=1)
+
+    x, y = _catmull_rom_periodic(ctrl_pts, samples_per_seg=samples_per_seg)
+    n_fine = len(x)
+    t_param = np.arange(n_fine)                    # uniform parameter index
+
+    # numerical derivatives wrt parameter (curvature formula is invariant
+    # to the choice of regular parameterization)
+    dx = np.gradient(x, t_param, edge_order=2)
+    dy = np.gradient(y, t_param, edge_order=2)
+    d2x = np.gradient(dx, t_param, edge_order=2)
+    d2y = np.gradient(dy, t_param, edge_order=2)
+
+    speed = np.sqrt(dx**2 + dy**2) + 1e-9
+    kappa = (dx * d2y - dy * d2x) / speed**3
+
+    ds_fine = np.concatenate([[0.0], np.cumsum(
+        0.5 * (speed[:-1] + speed[1:]))])
+    DL = ds_fine[-1] + 0.5 * (speed[-1] + speed[0])   # closes the loop
+
+    return dict(theta=t_param, x=x, y=y, kappa=kappa, s=ds_fine, DL=DL)
+
+def resample_equal_arclength(x, y, n_seg):
+    """Reparametrize a closed polyline (x[-1] ~= x[0]) to n_seg equal
+    arc-length segments. Returns x, y, and a scalar ds - same convention
+    as discretize_track's output."""
+    seg_lengths = np.hypot(np.diff(x), np.diff(y))
+    s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    L = s[-1]
+    s_new = np.linspace(0, L, n_seg + 1)
+    x_new = np.interp(s_new, s, x)
+    y_new = np.interp(s_new, s, y)
+    return x_new, y_new, L / n_seg
+
+
+def line_curvature(x, y, ds):
+    """Curvature of an equal-arc-length-spaced polyline, using ds as the
+    uniform step for the finite-difference derivatives."""
+    dx = np.gradient(x, ds)
+    dy = np.gradient(y, ds)
+    d2x = np.gradient(dx, ds)
+    d2y = np.gradient(dy, ds)
+    speed = np.sqrt(dx**2 + dy**2) + 1e-9
+    return (dx * d2y - dy * d2x) / speed**3
 
 def discretize_track(track, n_seg=60):
     """Resample the track into n_seg segments of EQUAL arc length ds,
