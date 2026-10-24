@@ -35,8 +35,8 @@ Plots are written to `--out` (default: current directory) as `f1_dp_<track>.png`
   loading the ICE).
 - Braking regen is computed from the actual state: when the ICE-only next speed would exceed the
   next node's $v_max$ the car brakes, the MGU-K is in regen mode ($u = 0$) and recovers
-  $\min(P_{MGUK} * $\Delta t$, KE)$. `eta_regen` is applied once per harvested joule.
-- The only stochastic element is a multiplicative factor $max(0, 1 + \sigma * z)$ on braking regen.
+  $\min(P_{MGUK} \cdot \Delta t, KE)$. `eta_regen` is applied once per harvested joule.
+- The only stochastic element is a multiplicative factor $max(0, 1 + \sigma \cdot z)$ on braking regen.
 - The DP is solved for a steady-state lap (relative value iteration, `solve_periodic`), so the
   battery cannot be drained for free at the end of the lap.
 - The per-lap recovery limit ($~8.5 \ MJ$) is checked on the optimal trajectory but **not** enforced
