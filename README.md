@@ -9,8 +9,8 @@ gains down the following straight. We formulate this energy management problem a
 process and solve it using dynamic programming. In the baseline formulation, the racing circuit is
 discretized by distance, and a Bellman recursion determines, at each track position, s and battery
 state, b, whether to deploy stored energy, subject to a traction-limited velocity ceiling derived from
-track curvature and vehicle dynamics, vmax (drag, rolling resistance, power-to-force conversion). This
-is extended to a continuous throttle-fraction control, $u_t \in [0, 1]$, and a stochastic battery model that
+track curvature and vehicle dynamics, $v_max$ (drag, rolling resistance, power-to-force conversion). This
+is extended to a continuous throttle-fraction control, $u_t \in [-1, 1]$, and a stochastic battery model that
 accounts for variability in braking-zone energy recovery, yielding a bi-state stochastic optimal control
 problem. Physical constraints such as battery capacity, MGU-K power ceiling, and per-lap energy limits
 are taken from the 2026 FIA Technical Regulations, and the resulting optimal policy projected to be validated against
@@ -31,15 +31,15 @@ Plots are written to `--out` (default: current directory) as `f1_dp_<track>.png`
 
 ### Model summary
 
-- State `(v, b)`: speed and battery energy; control `u in [-1, 1]` (`+` deploy, `-` harvest by
+- State $(v, b)$: speed and battery energy; control $u \in [-1, 1]$ (`+` deploy, `-` harvest by
   loading the ICE).
 - Braking regen is computed from the actual state: when the ICE-only next speed would exceed the
-  next node's `v_max` the car brakes, the MGU-K is in regen mode (`u = 0`) and recovers
-  `min(P_mguk * dt, kinetic energy shed)`. `eta_regen` is applied once per harvested joule.
-- The only stochastic element is a multiplicative factor `max(0, 1 + sigma * z)` on braking regen.
+  next node's $v_max$ the car brakes, the MGU-K is in regen mode ($u = 0$) and recovers
+  $\min(P_{MGUK} * $\Delta t$, KE)$. `eta_regen` is applied once per harvested joule.
+- The only stochastic element is a multiplicative factor $max(0, 1 + \sigma * z)$ on braking regen.
 - The DP is solved for a steady-state lap (relative value iteration, `solve_periodic`), so the
   battery cannot be drained for free at the end of the lap.
-- The per-lap recovery limit (~8.5 MJ) is checked on the optimal trajectory but **not** enforced
+- The per-lap recovery limit ($~8.5 \ MJ$) is checked on the optimal trajectory but **not** enforced
   inside the DP.
 
 ### Data and attribution
