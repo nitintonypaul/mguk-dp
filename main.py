@@ -1,47 +1,3 @@
-"""
-Stochastic Dynamic Programming for Optimal Power-Split Control in F1
-=====================================================================
-Demo implementation of the formulation in the project PDFs:
-  - Eq (1): stage-additive lap-time objective, min sum ell(v_t,u_t)
-  - Eq (2): net force Fn = F_ICE(v) + u*Pmax_MGUK/v - Fdrag(v,d) - Frolling
-  - Eq (3): velocity update, clipped by segment vmax(d)
-  - Eq (4): battery SoC update with regen harvesting; the uncertainty is a
-            multiplicative factor on the braking regen (not additive
-            noise on the battery, which the 0 / b_max clip would rectify)
-  - Eq (5): stage cost ell(v,u) = ds / v
-  - Eq (6): Bellman backward recursion
-  - Extra constraints supplied separately:
-        b_t = 0  =>  u_t <= 0   (no deployment from an empty battery)
-        0 <= b_t <= b_max = 4 MJ
-
-Changes to the energy model (see commit message for the reasoning):
-  - The control is u in [-1, 1]. u > 0 deploys, u < 0 harvests by loading
-    the ICE (costs drive force, charges the battery).
-  - Braking regen is computed from the *actual* state: whenever the car
-    would exceed the next node's v_max it must brake, the MGU-K is in regen
-    mode (u = 0), and it recovers min(P_mguk * dt, kinetic energy shed).
-  - The terminal condition is no longer V_T = 0. The DP is solved for a
-    steady-state (periodic) lap: V_T is the lap's own cost-to-go, found by
-    relative value iteration. The battery therefore cannot be drained for
-    free at the end of the lap.
-
-Tracks:
-  python main.py --track Spa        real circuit, minimum-curvature racing line
-                                    from the TUMFTM racetrack-database
-  python main.py --list             available circuits
-  python main.py --track random     the original procedural demo track
-  python main.py --fast             coarse grid for quick iteration
-
-This is a BALLPARK demo (not a competition lap-sim): physical constants are
-rough public-domain figures for 2026-era F1 cars, and the real-track racing
-line is a computed minimum-curvature line, not a driven or minimum-time one.
-
-
-IMMEDIATE NEXT STEPS:
-- Validate against FastF1 telemetry (driven line, speed, brake flags)
-- Separate plotting engine for visual customization
-"""
-
 import argparse
 import os
 
@@ -71,7 +27,7 @@ b_max      = 4.0e6        # J = 4 MJ (given constraint: 0 <= b_t <= b_max)
 eta_regen  = 0.6          # shaft -> battery harvesting efficiency, applied ONCE to
                            # every harvested joule (braking and ICE-loaded).
                            # TODO: cite a source; results are sensitive to it.
-SIGMA_REGEN = 0.20        # std-dev of the multiplicative factor on braking regen
+SIGMA_REGEN = 0.05        # std-dev of the multiplicative factor on braking regen
                            # (regen actually harvested = nominal * max(0, 1 + sigma*z))
 E_REC_CAP  = 8.5e6        # J per lap, approx. 2026 recovery limit (checked after the
                            # solve on the optimal trajectory, not enforced inside the DP)
@@ -196,6 +152,7 @@ def solve_periodic(disc, vmax, n_iter=40, tol=2e-3, alpha=1.0, verbose=True, **k
     """
     h = None
     sol = None
+    converged = False 
     for it in range(n_iter):
         sol = solve_bellman(disc, vmax, V_T=h, **kw)
         V0 = sol["V"][0]
@@ -211,6 +168,9 @@ def solve_periodic(disc, vmax, n_iter=40, tol=2e-3, alpha=1.0, verbose=True, **k
             h_new = (1 - alpha) * h + alpha * h_new
         h = h_new
     sol["periodic_iters"] = it + 1
+    sol["periodic_converged"] = converged  # <-- add
+    if not converged:                      # <-- add
+        print(f"  WARNING: periodic iteration did not converge in {n_iter} iterations")
     return sol
 
 
@@ -325,11 +285,58 @@ def build_real_problem(name, ds_target=5.0, smooth=0.0):
                 line_x=disc["x"], line_y=disc["y"], outline=rt.track_polygon(name),
                 start=(disc["x"][0], disc["y"][0]), line_label="racing line")
 
+def _panel_track(ax, problem, vmax_seg):
+    line_x, line_y = problem["line_x"], problem["line_y"]
+    # ax.set_facecolor("#4a4a4a")   # dark backdrop so the yellow (fast) sections stay visible
+    points = np.array([line_x, line_y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points, np.roll(points, -1, axis=0)], axis=1)
+    lc = LineCollection(segments, cmap="viridis", linewidth=2.5, zorder=2)
+    lc.set_array(vmax_seg)
+    ax.add_collection(lc)
+    ax.plot(*problem["start"], marker="s", color="white", markeredgecolor="black",
+            markersize=10, zorder=3)
+    ax.set_xlim(line_x.min() - 20, line_x.max() + 20)
+    ax.set_ylim(line_y.min() - 20, line_y.max() + 20)
+    ax.set_aspect("equal")
+    ax.set_title(f"{problem['name']} + {problem['line_label']}")
+    ax.figure.colorbar(lc, ax=ax, label=r"theoretical $v_{max}$ (m/s)")
+
+
+def _panel_velocity(ax, disc, vmax_seg, sim):
+    ax.plot(disc["s_bounds"], vmax_seg, "k--", label=r"$v_{max}(d)$ ceiling")
+    ax.plot(disc["s_bounds"], sim["v"], "b-", label=r"optimal $v_t$ (DP)")
+    ax.set_xlabel("distance s (m)")
+    ax.set_ylabel("velocity (m/s)")
+    ax.set_title("Velocity profile")
+    ax.legend(fontsize=9)
+
+
+def _panel_control(ax, disc, sim):
+    s_mid = 0.5 * (disc["s_bounds"][:-1] + disc["s_bounds"][1:])
+    ax.step(s_mid, sim["u"], where="mid", color="tab:orange", label=r"$u_t$ (+deploy / -harvest)")
+    ax.fill_between(disc["s_bounds"][:-1], -1, 1, where=sim["brake"], step="post",
+                    color="grey", alpha=0.3, label="braking (regen)")
+    ax.axhline(0, color="k", lw=0.5)
+    ax.set_xlabel("distance s (m)")
+    ax.set_ylabel(r"$u_t$ (deploy / harvest fraction)")
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_title("Optimal MGU-K power-split policy")
+    ax.legend(fontsize=9)
+
+
+def _panel_battery(ax, disc, sim, e_rec):
+    ax.plot(disc["s_bounds"], sim["b"] / 1e6, "g-")
+    ax.axhline(b_max / 1e6, color="k", ls=":", lw=1)
+    ax.axhline(0, color="k", ls=":", lw=1)
+    ax.set_xlabel("distance s (m)")
+    ax.set_ylabel("battery energy (MJ)")
+    ax.set_title(f"Battery SoC  (deploy {sim['e_deploy'] / 1e6:.1f} MJ, "
+                 f"harvest {e_rec / 1e6:.1f} MJ per lap)")
 
 # ---------------------------------------------------------------------------
 #    Run the full demo
 # ---------------------------------------------------------------------------
-def run(problem, grid, n_mc=200, sigma_regen=SIGMA_REGEN, out_dir="."):
+def run(problem, grid, n_mc=200, sigma_regen=SIGMA_REGEN, out_dir=".", split=False):
     disc = problem["disc"]
     line_x, line_y = problem["line_x"], problem["line_y"]
 
@@ -374,65 +381,33 @@ def run(problem, grid, n_mc=200, sigma_regen=SIGMA_REGEN, out_dir="."):
           f"std {mc_drift.std() / 1e6:.3f} MJ")
 
     # ---------------- plots ----------------
-    s_mid = 0.5 * (disc["s_bounds"][:-1] + disc["s_bounds"][1:])
+    panels = [   # (file suffix, figsize, draw function)
+        ("track",    (7, 8),  lambda ax: _panel_track(ax, problem, vmax_seg)),
+        ("velocity", (10, 5), lambda ax: _panel_velocity(ax, disc, vmax_seg, sim)),
+        ("control",  (10, 5), lambda ax: _panel_control(ax, disc, sim)),
+        ("battery",  (10, 5), lambda ax: _panel_battery(ax, disc, sim, e_rec)),
+    ]
+    saved = []
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
-
-    ax = axes[0, 0]
-    ax.plot(*problem["start"], marker="s", color="white", markeredgecolor="black", markersize=10, zorder=3, label="start/finish")
-
-    poly_x, poly_y = problem["outline"]
-    ax.fill(poly_x, poly_y, color="#4a4a4a", zorder=1, label="track surface")
-
-    points = np.array([line_x, line_y]).T.reshape(-1, 1, 2)
-    segments = np.concatenate([points, np.roll(points, -1, axis=0)], axis=1)
-    lc = LineCollection(segments, cmap="viridis", linewidth=2, zorder=2)
-    lc.set_array(vmax_seg)
-    ax.add_collection(lc)
-
-    ax.set_xlim(poly_x.min() - 20, poly_x.max() + 20)
-    ax.set_ylim(poly_y.min() - 20, poly_y.max() + 20)
-    ax.set_aspect("equal")
-    ax.set_title(f"{problem['name']} + {problem['line_label']}")
-    plt.colorbar(lc, ax=ax, label=r"theoretical $v_{max}$ (m/s)")
-
-    # (b) velocity profile: theoretical ceiling vs DP-optimal trajectory
-    ax = axes[0, 1]
-    ax.plot(disc["s_bounds"], vmax_seg, "k--", label=r"$v_{max}(d)$ ceiling")
-    ax.plot(disc["s_bounds"], sim["v"], "b-", label=r"optimal $v_t$ (DP)")
-    ax.set_xlabel("distance s (m)")
-    ax.set_ylabel("velocity (m/s)")
-    ax.set_title("Velocity profile")
-    ax.legend(fontsize=8)
-
-    # (c) control (MGU-K deploy / harvest fraction) + braking
-    ax = axes[1, 0]
-    ax.step(s_mid, sim["u"], where="mid", color="tab:orange", label=r"$u_t$ (+deploy / -harvest)")
-    ax.fill_between(disc["s_bounds"][:-1], -1, 1, where=sim["brake"], step="post",
-                     color="grey", alpha=0.3, label="braking (regen)")
-    ax.axhline(0, color="k", lw=0.5)
-    ax.set_xlabel("distance s (m)")
-    ax.set_ylabel(r"$u_t$ (deploy / harvest fraction)")
-    ax.set_ylim(-1.05, 1.05)
-    ax.set_title("Optimal MGU-K power-split policy")
-    ax.legend(fontsize=8)
-
-    # (d) battery SoC profile
-    ax = axes[1, 1]
-    ax.plot(disc["s_bounds"], sim["b"] / 1e6, "g-")
-    ax.axhline(b_max / 1e6, color="k", ls=":", lw=1)
-    ax.axhline(0, color="k", ls=":", lw=1)
-    ax.set_xlabel("distance s (m)")
-    ax.set_ylabel("battery energy (MJ)")
-    ax.set_title(f"Battery SoC  (deploy {sim['e_deploy'] / 1e6:.1f} MJ, "
-                 f"harvest {e_rec / 1e6:.1f} MJ per lap)")
-
-    fig.suptitle(f"F1 power-split DP  |  {problem['name']}  |  steady-state lap = {sim['lap_time']:.2f} s "
-                 f"(MC mean {mc_times.mean():.2f} +/- {mc_times.std():.2f} s)",
-                 fontsize=12)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    demo_png = os.path.join(out_dir, f"f1_dp_{problem['tag']}.png")
-    fig.savefig(demo_png, dpi=150)
+    if split:
+        for name, size, draw in panels:
+            f, ax = plt.subplots(figsize=size)
+            draw(ax)
+            f.tight_layout()
+            path = os.path.join(out_dir, f"f1_dp_{problem['tag']}_{name}.png")
+            f.savefig(path, dpi=200)
+            plt.close(f)
+            saved.append(path)
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+        for ax, (_, _, draw) in zip(axes.flat, panels):
+            draw(ax)
+        fig.suptitle(f"F1 power-split DP  |  {problem['name']}  |  steady-state lap = {sim['lap_time']:.2f} s "
+                     f"(MC mean {mc_times.mean():.2f} +/- {mc_times.std():.2f} s)", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        path = os.path.join(out_dir, f"f1_dp_{problem['tag']}.png")
+        fig.savefig(path, dpi=150)
+        saved.append(path)
 
     # separate histogram figure for the Monte-Carlo lap-time distribution
     fig2, ax2 = plt.subplots(figsize=(6, 4))
@@ -447,8 +422,10 @@ def run(problem, grid, n_mc=200, sigma_regen=SIGMA_REGEN, out_dir="."):
     fig2.savefig(mc_png, dpi=150)
 
     print("\nSaved plots:")
-    print(demo_png)
-    print(mc_png)
+    mc_png = os.path.join(out_dir, f"f1_dp_{problem['tag']}_montecarlo.png")
+    fig2.savefig(mc_png, dpi=150)
+    saved.append(mc_png)
+    print("\n".join(saved))
 
 
 def main(argv=None):
@@ -467,6 +444,8 @@ def main(argv=None):
                    help=f"std-dev of the multiplicative regen noise (default {SIGMA_REGEN})")
     p.add_argument("--fast", action="store_true", help="coarse DP grid for quick iteration")
     p.add_argument("--out", default=".", help="directory for the plots (default: current directory)")
+    p.add_argument("--split", action="store_true",
+                   help="save each of the four panels as its own figure instead of one 2x2 figure")
     args = p.parse_args(argv)
 
     if args.list:
@@ -483,7 +462,7 @@ def main(argv=None):
 
     grid = dict(n_v=25, n_b=17, n_u=11) if args.fast else dict(n_v=37, n_b=25, n_u=21)
     os.makedirs(args.out, exist_ok=True)
-    run(problem, grid, n_mc=args.mc_runs, sigma_regen=args.sigma_regen, out_dir=args.out)
+    run(problem, grid, n_mc=args.mc_runs, sigma_regen=args.sigma_regen, out_dir=args.out, split=args.split)
 
 
 if __name__ == "__main__":

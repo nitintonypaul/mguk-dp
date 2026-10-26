@@ -12,9 +12,8 @@ state, b, whether to deploy stored energy, subject to a traction-limited velocit
 track curvature and vehicle dynamics, $v_max$ (drag, rolling resistance, power-to-force conversion). This
 is extended to a continuous throttle-fraction control, $u_t \in [-1, 1]$, and a stochastic battery model that
 accounts for variability in braking-zone energy recovery, yielding a bi-state stochastic optimal control
-problem. Physical constraints such as battery capacity, MGU-K power ceiling, and per-lap energy limits
-are taken from the 2026 FIA Technical Regulations, and the resulting optimal policy projected to be validated against
-real race telemetry obtained via the FastF1 API. This project demonstrates how energy-constrained sequential decision-making under uncertainty, a canonical operations research structure, governs realtime performance optimization in modern motorsport.
+problem. This project demonstrates how energy-constrained sequential decision-making under uncertainty, 
+a canonical operations research structure, governs realtime performance optimization in modern motorsport.
 
 ## Running
 
@@ -34,7 +33,7 @@ Plots are written to `--out` (default: current directory) as `f1_dp_<track>.png`
 - State $(v, b)$: speed and battery energy; control $u \in [-1, 1]$ (`+` deploy, `-` harvest by
   loading the ICE).
 - Braking regen is computed from the actual state: when the ICE-only next speed would exceed the
-  next node's $v_max$ the car brakes, the MGU-K is in regen mode ($u = 0$) and recovers
+  next node's $v_{max}$ the car brakes, the MGU-K is in regen mode ($u = 0$) and recovers
   $\min(P_{MGUK} \cdot \Delta t, KE)$. `eta_regen` is applied once per harvested joule.
 - The only stochastic element is a multiplicative factor $max(0, 1 + \sigma \cdot z)$ on braking regen.
 - The DP is solved for a steady-state lap (relative value iteration, `solve_periodic`), so the
